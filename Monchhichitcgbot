@@ -1,0 +1,501 @@
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+import os
+
+TOKEN = os.getenv("BOT_TOKEN")
+
+ADMIN_IDS = {
+    88738317,  # replace with your Telegram user ID
+}
+
+CHANNEL_ID = -1003848901179  # replace with your channel ID
+
+sales = {}
+sale_id_counter = 1
+
+# user_id -> {sale_id: paid_qty}
+paid_records = {}
+
+
+def money(cents: int) -> str:
+    return f"${cents / 100:.2f}"
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
+
+
+def display_name(user_id=None, username=None, first_name=None) -> str:
+    if username:
+        return f"@{username}"
+    if first_name:
+        return first_name
+    return str(user_id)
+
+
+async def notify_admins(context, text):
+    for admin_id in ADMIN_IDS:
+        try:
+            await context.bot.send_message(chat_id=admin_id, text=text)
+        except Exception:
+            pass
+
+
+def render_sale_text(sale):
+    lines = [
+        f"⚡ {sale['name']}",
+        f"Price: {money(sale['price'])}",
+        f"Remaining: {sale['remaining_qty']}/{sale['total_qty']}",
+    ]
+
+    if sale["remaining_qty"] <= 0:
+        lines.append("Status: CLAIMED")
+    else:
+        lines.append("Status: AVAILABLE")
+
+    lines.append("")
+    lines.append("💬 Reply to this post with:")
+    lines.append("claim")
+
+    return "\n".join(lines)
+
+
+async def update_sale_post(context, sale_id):
+    sale = sales.get(sale_id)
+    if not sale:
+        return
+
+    text = render_sale_text(sale)
+
+    try:
+        if sale.get("is_photo"):
+            await context.bot.edit_message_caption(
+                chat_id=sale["chat_id"],
+                message_id=sale["message_id"],
+                caption=text,
+            )
+        else:
+            await context.bot.edit_message_text(
+                chat_id=sale["chat_id"],
+                message_id=sale["message_id"],
+                text=text,
+            )
+    except Exception:
+        pass
+
+
+def get_claimant(sale, user_id):
+    return next((c for c in sale["claimants"] if c["user_id"] == user_id), None)
+
+
+def allocate_one_unit_to_user(sale, user_id, display):
+    existing = get_claimant(sale, user_id)
+
+    if existing:
+        existing["qty"] += 1
+    else:
+        sale["claimants"].append({
+            "user_id": user_id,
+            "display": display,
+            "qty": 1,
+        })
+
+    sale["remaining_qty"] -= 1
+
+
+def get_paid_qty(user_id: int, sale_id: int) -> int:
+    return paid_records.get(user_id, {}).get(sale_id, 0)
+
+
+def set_paid_qty(user_id: int, sale_id: int, qty: int):
+    if user_id not in paid_records:
+        paid_records[user_id] = {}
+    paid_records[user_id][sale_id] = qty
+
+
+def get_user_claim_lines(user_id: int):
+    lines = []
+
+    for sale in sales.values():
+        claimant = get_claimant(sale, user_id)
+        if claimant:
+            subtotal = claimant["qty"] * sale["price"]
+            lines.append(f"{sale['name']} x{claimant['qty']} — {money(subtotal)}")
+
+    return lines
+
+
+def get_user_unpaid_claim_lines_and_total(user_id: int):
+    lines = []
+    total = 0
+
+    for sale in sales.values():
+        claimant = get_claimant(sale, user_id)
+        if not claimant:
+            continue
+
+        paid_qty = get_paid_qty(user_id, sale["sale_id"])
+        unpaid_qty = claimant["qty"] - paid_qty
+
+        if unpaid_qty <= 0:
+            continue
+
+        subtotal = unpaid_qty * sale["price"]
+        total += subtotal
+        lines.append(f"{sale['name']} x{unpaid_qty} — {money(subtotal)}")
+
+    return lines, total
+
+
+START_TEXT = """Hello! I’m @monchhichiTCGbot 🧸✨
+
+I’ll help you keep track of your claims!
+
+Thank you for claiming! An admin will be in touch with you for payment shortly :)
+
+💖 Commands
+/list — View your claimed items
+/invoice — View your current unpaid invoice
+/help — View help menu
+
+📩 Need help?
+DM @kqssssssss
+
+🧾 Payment & Collection
+Payment must be made within 24 hours after billing ♡
+Self-collection at Woodlands (location shared upon payment)
+
+Happy claiming! 🫶
+"""
+
+HELP_TEXT = """Hello! I’m @monchhichiTCGbot 🧸✨
+
+Buyer commands
+/list — View your claimed items
+/invoice — View your current unpaid invoice
+
+Admin commands
+/sell <name> | <price> | <quantity>
+/adminsummary — View all claimants and unpaid totals
+/markpaid <user_id> — Mark a user's current invoice as paid
+
+Buyer action
+Reply to sale post with: claim
+"""
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(START_TEXT)
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+
+async def myid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        f"Your Telegram user ID is: {update.effective_user.id}"
+    )
+
+
+async def list_items(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+
+    lines = get_user_claim_lines(user.id)
+
+    if not lines:
+        await update.message.reply_text("You haven’t claimed anything yet 🥺")
+        return
+
+    text = "🧸 Your claimed items:\n\n" + "\n".join(lines)
+    await update.message.reply_text(text)
+
+
+async def invoice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user:
+        return
+
+    lines, total = get_user_unpaid_claim_lines_and_total(user.id)
+
+    if not lines:
+        await update.message.reply_text("No unpaid claims at the moment ✨")
+        return
+
+    text = "🧾 Your current unpaid invoice:\n\n"
+    text += "\n".join(lines)
+    text += f"\n\n💰 Total: {money(total)}"
+
+    await update.message.reply_text(text)
+
+
+async def sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global sale_id_counter
+
+    msg = update.message
+    user = update.effective_user
+
+    if not msg:
+        return
+
+    if not user or user.id not in ADMIN_IDS:
+        await msg.reply_text("Only admin can create sales.")
+        return
+
+    raw_input = msg.text or msg.caption
+    if not raw_input:
+        await msg.reply_text("Usage: /sell name | price | quantity")
+        return
+
+    raw = raw_input.replace("/sell", "", 1).strip()
+    parts = [p.strip() for p in raw.split("|")]
+
+    if len(parts) != 3:
+        await msg.reply_text("Usage: /sell name | price | quantity")
+        return
+
+    try:
+        name = parts[0]
+        price = int(float(parts[1]) * 100)
+        qty = int(parts[2])
+    except Exception:
+        await msg.reply_text("Invalid format.")
+        return
+
+    if price <= 0 or qty <= 0:
+        await msg.reply_text("Price and quantity must be > 0.")
+        return
+
+    sale_id = sale_id_counter
+    sale_id_counter += 1
+
+    sale = {
+        "sale_id": sale_id,
+        "name": name,
+        "price": price,
+        "total_qty": qty,
+        "remaining_qty": qty,
+        "claimants": [],
+        "chat_id": None,
+        "message_id": None,
+        "is_photo": False,
+    }
+
+    text = render_sale_text(sale)
+
+    try:
+        if msg.photo:
+            file_id = msg.photo[-1].file_id
+            sent = await context.bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=file_id,
+                caption=text,
+            )
+            sale["is_photo"] = True
+
+        elif msg.reply_to_message and msg.reply_to_message.photo:
+            file_id = msg.reply_to_message.photo[-1].file_id
+            sent = await context.bot.send_photo(
+                chat_id=CHANNEL_ID,
+                photo=file_id,
+                caption=text,
+            )
+            sale["is_photo"] = True
+
+        else:
+            sent = await context.bot.send_message(
+                chat_id=CHANNEL_ID,
+                text=text,
+            )
+
+    except Exception as e:
+        await msg.reply_text(f"Error: {e}")
+        return
+
+    sale["chat_id"] = sent.chat_id
+    sale["message_id"] = sent.message_id
+    sales[sale_id] = sale
+
+    await msg.reply_text(f"Sale #{sale_id} posted.")
+
+
+async def admin_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("Only admin can view the summary.")
+        return
+
+    users_found = set()
+    lines = []
+
+    for sale in sales.values():
+        for claimant in sale["claimants"]:
+            users_found.add((claimant["user_id"], claimant["display"]))
+
+    if not users_found:
+        await update.message.reply_text("No claims yet.")
+        return
+
+    for user_id, display in sorted(users_found, key=lambda x: x[1].lower()):
+        claim_lines = []
+        subtotal_unpaid = 0
+
+        for sale in sales.values():
+            claimant = get_claimant(sale, user_id)
+            if not claimant:
+                continue
+
+            total_qty = claimant["qty"]
+            paid_qty = get_paid_qty(user_id, sale["sale_id"])
+            unpaid_qty = max(total_qty - paid_qty, 0)
+
+            subtotal_unpaid += unpaid_qty * sale["price"]
+
+            claim_lines.append(
+                f"{sale['name']} x{total_qty} (unpaid: {unpaid_qty}) — {money(total_qty * sale['price'])}"
+            )
+
+        block = [
+            f"{display} | {user_id}",
+            *claim_lines,
+            f"Current unpaid total: {money(subtotal_unpaid)}",
+        ]
+        lines.append("\n".join(block))
+
+    text = "📋 Admin Summary\n\n" + "\n\n".join(lines)
+    await update.message.reply_text(text)
+
+
+async def mark_paid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        await update.message.reply_text("Only admin can mark invoices as paid.")
+        return
+
+    if len(context.args) != 1:
+        await update.message.reply_text("Usage: /markpaid <user_id>")
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("User ID must be a number.")
+        return
+
+    any_unpaid = False
+
+    for sale in sales.values():
+        claimant = get_claimant(sale, target_user_id)
+        if not claimant:
+            continue
+
+        current_qty = claimant["qty"]
+        paid_qty = get_paid_qty(target_user_id, sale["sale_id"])
+
+        if current_qty > paid_qty:
+            set_paid_qty(target_user_id, sale["sale_id"], current_qty)
+            any_unpaid = True
+
+    if not any_unpaid:
+        await update.message.reply_text("No unpaid claims found for that user.")
+        return
+
+    await update.message.reply_text(
+        f"Marked current invoice as paid for user {target_user_id}."
+    )
+
+
+async def text_reply_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
+    msg = update.message
+    text = msg.text.lower().strip()
+    replied = msg.reply_to_message
+    user = update.effective_user
+
+    if not user:
+        return
+
+    if not replied:
+        await msg.reply_text("Reply to the sale post.")
+        return
+
+    sale = next(
+        (s for s in sales.values() if s["message_id"] == replied.message_id),
+        None
+    )
+
+    if not sale:
+        if replied.is_automatic_forward and replied.sender_chat and replied.sender_chat.id == CHANNEL_ID:
+            origin = getattr(replied, "forward_origin", None)
+            origin_id = getattr(origin, "message_id", None)
+
+            if origin_id is not None:
+                sale = next(
+                    (s for s in sales.values() if s["message_id"] == origin_id),
+                    None
+                )
+
+    if not sale:
+        await msg.reply_text("Invalid sale post.")
+        return
+
+    display = display_name(user.id, user.username, user.first_name)
+
+    if text == "claim":
+        if sale["remaining_qty"] <= 0:
+            await msg.reply_text("Sold out.")
+            return
+
+        allocate_one_unit_to_user(sale, user.id, display)
+        await update_sale_post(context, sale["sale_id"])
+
+        await notify_admins(
+            context,
+            f"🟢 New claim\n"
+            f"Item: {sale['name']}\n"
+            f"User: {display}\n"
+            f"User ID: {user.id}\n"
+            f"Claimed 1 unit(s)\n"
+            f"Remaining: {sale['remaining_qty']}/{sale['total_qty']}"
+        )
+
+        await msg.reply_text(
+            f"Claim confirmed for {display}. Please start chat with @monchhichitcgbot for the payment process."
+        )
+        return
+
+
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("myid", myid))
+    app.add_handler(CommandHandler("list", list_items))
+    app.add_handler(CommandHandler("invoice", invoice))
+    app.add_handler(CommandHandler("sell", sell))
+    app.add_handler(CommandHandler("adminsummary", admin_summary))
+    app.add_handler(CommandHandler("markpaid", mark_paid))
+
+    app.add_handler(
+        MessageHandler(filters.PHOTO & filters.CaptionRegex(r"^/sell\b"), sell)
+    )
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_reply_handler))
+
+    print("Bot running...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
