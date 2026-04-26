@@ -12,7 +12,7 @@ import os
 TOKEN = os.getenv("BOT_TOKEN")
 
 ADMIN_IDS = {
-    88738317,  # replace with your Telegram user ID
+    88738317,363726159,  # replace with your Telegram user ID
 }
 
 CHANNEL_ID = -1003848901179  # replace with your channel ID
